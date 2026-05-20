@@ -136,6 +136,12 @@ impl IpcServer {
             let _ = std::fs::remove_file(socket_path);
         }
         let listener = UnixListener::bind(socket_path)?;
+        // Removes the socket file however serve() exits, including on panic.
+        struct SocketGuard(PathBuf);
+        impl Drop for SocketGuard {
+            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+        }
+        let _guard = SocketGuard(socket_path.to_owned());
         // Best-effort restrict permissions to user.
         #[cfg(unix)]
         {
@@ -175,7 +181,6 @@ impl IpcServer {
         }
 
         info!(socket = %socket_path.display(), "ipc.shutdown");
-        let _ = std::fs::remove_file(socket_path);
         Ok(())
     }
 
@@ -205,7 +210,7 @@ impl IpcServer {
             };
             let mut out = serde_json::to_vec(&resp).unwrap_or_else(|e| {
                 debug!(error = %e, "ipc.response_serialise_failed");
-                b"{}".to_vec()
+                br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal error"}}"#.to_vec()
             });
             out.push(b'\n');
             wr.write_all(&out).await?;

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bloom_prices::{CoinId, PricesClient, PricesError};
+use bloom_prices::{CoinId, PricesClient, PricesError, WELL_KNOWN_SYMBOLS};
 
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
@@ -145,8 +145,9 @@ impl PricesHandler {
             return Ok(vec![Entry::dir("spot"), Entry::dir("change_24h")]);
         }
         match path.segments()[0].as_str() {
-            "spot" if path.segments().len() == 1 => Ok(vec![]),
-            "change_24h" if path.segments().len() == 1 => Ok(vec![]),
+            "spot" | "change_24h" if path.segments().len() == 1 => {
+                Ok(WELL_KNOWN_SYMBOLS.iter().map(|s| Entry::file(s)).collect())
+            }
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
     }

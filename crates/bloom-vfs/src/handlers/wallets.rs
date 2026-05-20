@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use bloom_chain::ChainRegistry;
 use bloom_keystore::Keystore;
 use bloom_proto::{AddressBook, RawIntent, format_units};
-use bloom_tx::{intent_parser, outbox::OutboxState, tx_engine::TxEngine};
+use bloom_tx::{intent_parser, outbox::OutboxState, tx_engine::{TxEngine, TxEngineError}};
 
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
@@ -714,7 +714,10 @@ impl WalletsHandler {
                         confirm_text,
                     )
                     .await
-                    .map_err(err_be)?;
+                    .map_err(|e| match e {
+                        TxEngineError::EnsoQuoteStale { .. } => HandlerError::invalid(e.to_string()),
+                        other => err_be(other),
+                    })?;
                 Ok(())
             }
             // outbox/pending/<id>/cancel — fire a self-send replacement.

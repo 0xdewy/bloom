@@ -12,11 +12,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use bloom_daemon::Daemon;
 use bloom_daemon::ipc::{IpcClient, IpcServer, default_socket_path};
 use bloom_proto::HomeDir;
 use bloom_vfs::{VfsPath, handler::Handler};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
 
@@ -70,6 +73,10 @@ enum Cmd {
     Ipc(IpcCmd),
     /// Initialise ~/.bloom with default config + dirs.
     Init,
+    /// Print a shell completion script.
+    Completions {
+        shell: Shell,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -87,7 +94,10 @@ enum VfsCmd {
     /// `cat /bloom/<path>` — read a file via the VFS.
     Cat { path: String },
     /// `ls /bloom/<path>` — list a directory via the VFS.
-    Ls { path: String },
+    Ls {
+        #[arg(default_value = "/")]
+        path: String,
+    },
     /// Write data to a writable VFS path. Reads from stdin if `--data` is omitted.
     Write {
         path: String,
@@ -149,7 +159,7 @@ enum WalletCmd {
 async fn main() -> ExitCode {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
         )
         .with_target(false)
         .with_writer(std::io::stderr)
@@ -162,6 +172,33 @@ async fn main() -> ExitCode {
             eprintln!("error: {:#}", e);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Returns `None` when no daemon socket is present (daemon not started),
+/// propagating all other errors normally. A stale socket (file exists but
+/// connection refused) is removed and surfaced as an error rather than
+/// silently falling back to in-process — a stale socket almost always
+/// means the daemon crashed and the caller should restart it explicitly.
+async fn try_ipc(
+    client: &IpcClient,
+    method: &str,
+    params: serde_json::Value,
+) -> std::io::Result<Option<serde_json::Value>> {
+    match client.call(method, params).await {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!(error = %e, "ipc.no_daemon_fallback");
+            Ok(None)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            let _ = std::fs::remove_file(client.socket());
+            Err(std::io::Error::other(
+                "daemon socket exists but is not responding (stale socket removed); \
+                 start the daemon with 'bloom serve'",
+            ))
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -197,22 +234,19 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Vfs(VfsCmd::Cat { path }) => {
             let socket = default_socket_path(home.root());
             let p = VfsPath::parse(&path).context("parse path")?;
-            let bytes = if socket.exists() {
+            let client = IpcClient::new(&socket);
+            let ipc_res = try_ipc(&client, "read", serde_json::json!({ "path": path }))
+                .await
+                .context("ipc read")?;
+            let bytes = if let Some(res) = ipc_res {
                 debug!(socket = %socket.display(), "cli.vfs.cat.via_ipc");
-                let client = IpcClient::new(&socket);
-                let res = client
-                    .call("read", serde_json::json!({ "path": path }))
-                    .await
-                    .context("ipc read")?;
                 let b64 = res
                     .get("bytes_b64")
                     .and_then(|v| v.as_str())
                     .context("ipc read: missing bytes_b64")?;
-                use base64::Engine as _;
-                use base64::engine::general_purpose::STANDARD as B64;
                 B64.decode(b64).context("ipc read: bad base64")?
             } else {
-                debug!("cli.vfs.cat.via_inproc: no daemon socket present");
+                debug!("cli.vfs.cat.via_inproc");
                 let d = Daemon::from_home(home).context("build daemon")?;
                 d.vfs.read(&p).await.context("vfs read")?
             };
@@ -222,13 +256,12 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Vfs(VfsCmd::Ls { path }) => {
             let socket = default_socket_path(home.root());
             let p = VfsPath::parse(&path).context("parse path")?;
-            if socket.exists() {
+            let client = IpcClient::new(&socket);
+            let ipc_res = try_ipc(&client, "list", serde_json::json!({ "path": path }))
+                .await
+                .context("ipc list")?;
+            if let Some(res) = ipc_res {
                 debug!(socket = %socket.display(), "cli.vfs.ls.via_ipc");
-                let client = IpcClient::new(&socket);
-                let res = client
-                    .call("list", serde_json::json!({ "path": path }))
-                    .await
-                    .context("ipc list")?;
                 let arr = res.as_array().context("ipc list: expected array")?;
                 for e in arr {
                     let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
@@ -240,7 +273,7 @@ async fn run(cli: Cli) -> Result<()> {
                     println!("{}\t{}", name, kind);
                 }
             } else {
-                debug!("cli.vfs.ls.via_inproc: no daemon socket present");
+                debug!("cli.vfs.ls.via_inproc");
                 let d = Daemon::from_home(home).context("build daemon")?;
                 let entries = d.vfs.list(&p).await.context("vfs list")?;
                 for e in entries {
@@ -260,20 +293,18 @@ async fn run(cli: Cli) -> Result<()> {
                     buf
                 }
             };
-            if socket.exists() {
+            let client = IpcClient::new(&socket);
+            let ipc_res = try_ipc(
+                &client,
+                "write",
+                serde_json::json!({ "path": path, "bytes_b64": B64.encode(&body) }),
+            )
+            .await
+            .context("ipc write")?;
+            if ipc_res.is_some() {
                 debug!(socket = %socket.display(), "cli.vfs.write.via_ipc");
-                use base64::Engine as _;
-                use base64::engine::general_purpose::STANDARD as B64;
-                let client = IpcClient::new(&socket);
-                client
-                    .call(
-                        "write",
-                        serde_json::json!({ "path": path, "bytes_b64": B64.encode(&body) }),
-                    )
-                    .await
-                    .context("ipc write")?;
             } else {
-                debug!("cli.vfs.write.via_inproc: no daemon socket present");
+                debug!("cli.vfs.write.via_inproc");
                 let d = Daemon::from_home(home).context("build daemon")?;
                 d.vfs.write(&p, &body).await.context("vfs write")?;
             }
@@ -410,6 +441,10 @@ async fn run(cli: Cli) -> Result<()> {
             unmount_result?;
             info!("cli.serve.shutdown_complete");
             println!("shutting down");
+            Ok(())
+        }
+        Cmd::Completions { shell } => {
+            generate(shell, &mut Cli::command(), "bloom", &mut std::io::stdout());
             Ok(())
         }
         Cmd::Ipc(IpcCmd::Call { method, params }) => {

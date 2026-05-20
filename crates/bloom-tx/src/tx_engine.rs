@@ -90,6 +90,8 @@ pub enum TxEngineError {
     PrivateBroadcast(String),
     #[error("private RPC provider {provider} does not support chain {chain_id}")]
     PrivateProviderChainMismatch { provider: String, chain_id: u64 },
+    #[error("Enso quote is {age}s old (expires ~5 min) — re-run the intent for a fresh route, or write 'override' to broadcast anyway")]
+    EnsoQuoteStale { age: u64 },
 }
 
 /// In-memory cache for ERC-20 metadata keyed by `(chain_id, address)`.
@@ -784,8 +786,15 @@ impl TxEngine {
                 buffered.max(21_000)
             }
             Err(e) => {
-                tracing::warn!(error = %e, "estimate_gas failed; using 500k fallback");
-                500_000
+                // Use the hint from the external estimator (e.g. Enso) when
+                // available, applying the same 25% buffer. Fall back to 500k
+                // only if no hint was provided.
+                let fallback = intent
+                    .gas_limit_hint
+                    .map(|h| h.saturating_mul(125) / 100)
+                    .unwrap_or(500_000);
+                tracing::warn!(error = %e, fallback, "estimate_gas failed");
+                fallback
             }
         };
 
@@ -1039,6 +1048,15 @@ impl TxEngine {
                 "tx.policy_denied"
             );
             return Err(TxEngineError::PolicyDenied);
+        }
+
+        // Enso quotes embed a ~5-minute deadline. Warn before wasting gas.
+        const ENSO_QUOTE_MAX_AGE_SECS: u64 = 300;
+        let now_secs = (now_ms() / 1000) as u64;
+        if let Some(age) = enso_quote_age_secs(&staged.data_hex, now_secs) {
+            if age > ENSO_QUOTE_MAX_AGE_SECS && !override_text {
+                return Err(TxEngineError::EnsoQuoteStale { age });
+            }
         }
 
         // Broadcast gate: never broadcast to mainnet by default.
@@ -1352,6 +1370,21 @@ fn decode_data(s: &str) -> Result<Bytes, TxEngineError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     let v = hex::decode(s).map_err(|e| TxEngineError::Amount(format!("data: {e}")))?;
     Ok(Bytes::from(v))
+}
+
+/// Parse the Enso quote age in seconds from calldata, if present.
+/// Enso appends a raw JSON blob starting with `{"Source":"Enso` to every
+/// route calldata. Returns `None` for non-Enso calldata or parse failures.
+fn enso_quote_age_secs(data_hex: &str, now_secs: u64) -> Option<u64> {
+    let bytes = hex::decode(data_hex.trim_start_matches("0x")).ok()?;
+    const MARKER: &[u8] = b"{\"Source\":\"Enso";
+    let pos = bytes.windows(MARKER.len()).position(|w| w == MARKER)?;
+    let v: serde_json::Value = serde_json::Deserializer::from_slice(&bytes[pos..])
+        .into_iter()
+        .next()?
+        .ok()?;
+    let ts = v["Timestamp"].as_u64()?;
+    now_secs.checked_sub(ts)
 }
 
 fn now_ms() -> u128 {

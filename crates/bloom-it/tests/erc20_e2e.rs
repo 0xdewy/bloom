@@ -131,6 +131,7 @@ async fn erc20_stage_fails_when_decimals_unreadable() -> Result<()> {
         chain: Some("anvil".to_string()),
         gas: Default::default(),
         nonce: None,
+        gas_limit_hint: None,
     };
 
     let res = engine
@@ -175,6 +176,7 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
         chain: Some("anvil".to_string()),
         gas: Default::default(),
         nonce: None,
+        gas_limit_hint: None,
     };
 
     let staged = engine
